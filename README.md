@@ -2,6 +2,11 @@
 
 This repository contains a minimal example of a Go REST API protected by Keycloak using OAuth 2.0, OpenID Connect (OIDC), and JWT access tokens.
 
+Two ways to obtain a token are demonstrated:
+
+- **Resource Owner Password Credentials (ROPC)** — a direct `username`/`password` exchange via `curl`, useful for quick local testing.
+- **Authorization Code Flow with PKCE** — the browser-based flow used by `/login` and `/signup`, where the user authenticates directly on Keycloak's own pages and the API never sees their password.
+
 The API uses:
 
 - [Go](https://go.dev/)
@@ -10,40 +15,39 @@ The API uses:
 - [Keycloak](https://www.keycloak.org/)
 - Docker Compose
 
-User profiles are stored in memory to keep the example simple.
+User profiles and browser sessions are stored in memory to keep the example simple.
 
 ## Architecture
 
 ```text
-                         ┌──────────────────────┐
-                         │       Keycloak       │
-                         │                      │
-                         │ http://localhost:8080│
-                         │                      │
-                         │ Realm: myrealm       │
-                         └──────────┬───────────┘
-                                    │
+                         ┌────────────────────────┐
+                         │        Keycloak        │
+                         │  http://localhost:8080 │
+                         │  Realm: myrealm        │
+                         └────────────┬───────────┘
+                                      │
                               OAuth 2.0 / OIDC
-                                    │
-                                    │
-┌──────────────┐             ┌──────▼───────────┐
-│    Client    │             │     Go API       │
-│              │             │                  │
-│    curl      │             │ :8081            │
-└──────┬───────┘             └──────┬───────────┘
-       │                            │
-       │ Authorization:             │
-       │ Bearer <JWT>               │
-       └───────────────────────────►│
-                                    │
-                              Validate JWT
-                                    │
-                                    ▼
-                              User profile
-                              in memory
+                                      │
+                                      ▼
+                         ┌─────────────────────────┐
+                         │          Go API         │
+                         │         :8081           │
+                         │                         │
+                         │  /login    /signup      │
+                         │  /auth/callback         │
+                         │  /api/v1/profile         │
+                         └─────────┬─────────┬─────┘
+                                   │         │
+                    Authorization: │         │  session cookie
+                    Bearer <JWT>   │         │  (Authorization Code
+                    (ROPC)         │         │   + PKCE)
+                                   │         │
+                            ┌──────▼──┐   ┌──▼───────┐
+                            │  curl   │   │ Browser  │
+                            └─────────┘   └──────────┘
 ```
 
-The Go API does not contact Keycloak for every API request. It obtains Keycloak's public signing keys through the JWKS endpoint and validates JWT signatures locally.
+The Go API does not contact Keycloak for every API request. It obtains Keycloak's public signing keys through the JWKS endpoint and validates JWT signatures locally. The only per-request calls to Keycloak are the token exchange in `/auth/callback` and, occasionally, a JWKS refresh on signing-key rotation.
 
 ---
 
@@ -166,9 +170,20 @@ For this example, enable:
 
 ```text
 Direct access grants: ON
+Standard flow:        ON
 ```
 
-This is only being enabled to make it easy to obtain a token with `curl`.
+`Direct access grants` is what allows the ROPC `curl` requests in this guide to work. `Standard flow` is what enables the Authorization Code flow used by `/login` and `/signup` — without it, those routes will fail when Keycloak tries to redirect back to the API.
+
+Leave `Client authentication` **OFF**. The client stays public (no client secret): the Authorization Code exchange in `/auth/callback` is secured with PKCE instead, so no secret needs to be stored in the API.
+
+On the same client settings page, set:
+
+```text
+Valid redirect URIs: http://localhost:8081/auth/callback
+```
+
+Keycloak will refuse to redirect back to any URI that isn't listed here — this is what stops an attacker-registered client from stealing authorization codes meant for this API.
 
 The resulting client ID is:
 
@@ -223,6 +238,24 @@ Tokens issued after this point will include `my-api` in the `aud` claim:
 ```
 
 > Tokens obtained **before** this change will still have the old `aud` value. Request a new token after saving the mapper.
+
+---
+
+## 4.2 Enable User Registration (for `/signup`)
+
+The `/signup` endpoint sends the browser to Keycloak's own hosted registration page rather than implementing signup in the Go API itself.
+
+Go to:
+
+```text
+Realm settings
+    → Login
+    → User registration: ON
+```
+
+Without this, `/signup` will still redirect correctly, but Keycloak will fall back to showing the login page instead of a registration form.
+
+---
 
 # 5. Create a User
 
@@ -337,10 +370,20 @@ const (
     issuer   = "http://localhost:8080/realms/myrealm"
     audience = "my-api"
     jwksURL  = issuer + "/protocol/openid-connect/certs"
+
+    // Authorization Code flow endpoints.
+    authorizeURL = issuer + "/protocol/openid-connect/auth"
+    tokenURL     = issuer + "/protocol/openid-connect/token"
+    registerURL  = issuer + "/protocol/openid-connect/registrations"
+
+    // my-api is a public client (Client authentication OFF), so the
+    // Authorization Code flow relies on PKCE instead of a client secret.
+    clientID    = "my-api"
+    redirectURI = "http://localhost:8081/auth/callback"
 )
 ```
 
-These values correspond to the Keycloak configuration created above.
+These values correspond to the Keycloak configuration created above. `redirectURI` must exactly match the "Valid redirect URIs" entry configured in section 4.
 
 The API listens on:
 
@@ -376,16 +419,24 @@ The API should print:
 API listening on :8081
 ```
 
-The API now has two endpoints:
+The API now has the following endpoints:
 
 ```text
-GET /health
-GET /api/v1/profile
+GET /health              — public
+GET /login                — redirects the browser to Keycloak's login page
+GET /signup                — redirects the browser to Keycloak's registration page
+GET /auth/callback           — Keycloak redirects here after login/signup; starts a session
+GET /api/v1/profile            — requires a Bearer token OR an authenticated session
 ```
 
 `/health` is public.
 
-`/api/v1/profile` requires a valid JWT access token.
+`/login`, `/signup`, and `/auth/callback` are public — they're the routes that establish a session in the first place.
+
+`/api/v1/profile` requires either:
+
+- an `Authorization: Bearer <JWT>` header (obtained via ROPC, section 11), or
+- a `session_id` cookie set by `/auth/callback` after a successful browser login or signup.
 
 ---
 
@@ -407,9 +458,9 @@ Expected response:
 
 ---
 
-# 11. Obtain an Access Token from Keycloak
+# 11. Obtain an Access Token via curl (ROPC)
 
-For this development example, use the OAuth 2.0 Resource Owner Password Credentials grant.
+For quick local testing without a browser, use the OAuth 2.0 Resource Owner Password Credentials grant.
 
 Run:
 
@@ -457,9 +508,11 @@ If `jq` is installed, verify it:
 echo "$TOKEN"
 ```
 
+> Note the double quotes below — `Authorization: Bearer $TOKEN"` inside single quotes would send the literal string `$TOKEN` instead of its value.
+
 ---
 
-# 12. Call the Protected API
+# 12. Call the Protected API with the Token
 
 Use the access token in the HTTP `Authorization` header:
 
@@ -485,9 +538,31 @@ The API identifies the user using the `sub` claim from the JWT.
 
 ---
 
-# 13. What Happens Internally
+# 13. Log In or Sign Up via the Browser (Authorization Code + PKCE)
 
-When the request is made:
+This is the flow a real frontend would use — the API never handles the user's password.
+
+**Log in as an existing user:**
+
+1. Open `http://localhost:8081/login` in a browser.
+2. You're redirected to Keycloak's login page. Sign in as `antonio` / `password`.
+3. Keycloak redirects back to `http://localhost:8081/auth/callback` with an authorization code.
+4. The API exchanges the code for tokens, starts a session, and redirects to `/api/v1/profile`.
+5. You should see antonio's profile JSON, and a `session_id` cookie set in the browser.
+
+**Register a new user:**
+
+1. Open `http://localhost:8081/signup` instead.
+2. You land on Keycloak's own hosted registration form (username, email, first/last name, password).
+3. After submitting, the same callback flow runs, and you're redirected to `/api/v1/profile`.
+
+> The example's in-memory `profiles` map only has a seeded entry for `user-123` (antonio). A newly registered user will authenticate successfully but get `{"error":"profile_not_found"}` from `/api/v1/profile`, since there's no profile pre-populated for their Keycloak `sub`. A real application would create or link a profile record at this point — this example skips that to stay focused on the auth flow.
+
+---
+
+# 14. What Happens Internally
+
+When a request is made:
 
 ```http
 GET /api/v1/profile HTTP/1.1
@@ -497,15 +572,15 @@ Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
 
 the Go API performs the following operations.
 
-## Step 1 — Extract the Bearer token
+## Step 1 — Extract the token
 
-The authentication middleware reads:
+The authentication middleware first checks for:
 
 ```http
 Authorization: Bearer <JWT>
 ```
 
-and extracts the JWT.
+If that header is absent, it falls back to reading the `session_id` cookie and looking up the access token stored for that session (set by `/auth/callback` after a browser login or signup). Either path produces the same raw JWT for the remaining steps.
 
 ## Step 2 — Read the JWT header
 
@@ -607,9 +682,9 @@ and returns it.
 
 ---
 
-# 14. Test an Unauthenticated Request
+# 15. Test an Unauthenticated Request
 
-Call the protected endpoint without a token:
+Call the protected endpoint without a token and without a session cookie:
 
 ```bash
 curl http://localhost:8081/api/v1/profile
@@ -629,7 +704,7 @@ HTTP/1.1 401 Unauthorized
 
 ---
 
-# 15. Test an Invalid Token
+# 16. Test an Invalid Token
 
 Use an invalid token:
 
@@ -653,7 +728,7 @@ HTTP/1.1 401 Unauthorized
 
 ---
 
-# 16. JWT Validation and Key Rotation
+# 17. JWT Validation and Key Rotation
 
 The API initially downloads Keycloak's public keys when it starts.
 
@@ -699,7 +774,7 @@ This allows the API to handle Keycloak signing-key rotation.
 
 ---
 
-# 17. Important Security Considerations
+# 18. Important Security Considerations
 
 This repository is a demonstration and is intentionally simplified.
 
@@ -723,17 +798,17 @@ A production Keycloak deployment should use:
 - persistent storage
 - production Keycloak configuration
 
-## Do not use the password grant in modern applications
+## The password grant (ROPC) is for local testing only
 
-The example uses:
+Sections 11–12 use:
 
 ```text
 grant_type=password
 ```
 
-only to make testing with `curl` straightforward.
+only to make testing with `curl` straightforward, without needing a browser.
 
-For a real browser/mobile application, prefer:
+For any real browser or mobile application, use the flow implemented by `/login` and `/signup` instead:
 
 ```text
 Authorization Code Flow
@@ -741,26 +816,7 @@ Authorization Code Flow
 PKCE
 ```
 
-The normal architecture would be:
-
-```text
-User
- │
- ▼
-Frontend
- │
- │ Authorization Code + PKCE
- ▼
-Keycloak
- │
- │ Access Token
- ▼
-Frontend
- │
- │ Authorization: Bearer <JWT>
- ▼
-Go API
-```
+so the API and the browser code never see the user's raw credentials — only Keycloak does.
 
 ## Access tokens vs ID tokens
 
@@ -780,9 +836,22 @@ Access Token
     → intended for the API/resource server
 ```
 
+## The session store is in-memory and single-instance
+
+`/auth/callback` stores access tokens in a plain `map[string]Session` guarded by a mutex. This is fine for a local demo, but:
+
+- Sessions reset on every restart.
+- It won't work across multiple API instances behind a load balancer.
+
+A production deployment would back this with a shared store (Redis, a database) instead.
+
+## Cookies are not marked `Secure`
+
+The `session_id`, `oauth_state`, and `oauth_verifier` cookies are set with `secure=false` because this example runs over plain HTTP on `localhost`. Once the app is served over HTTPS, set `secure=true` so these cookies are never sent over an unencrypted connection.
+
 ---
 
-# 18. Useful Keycloak Endpoints
+# 19. Useful Keycloak Endpoints
 
 For the `myrealm` realm:
 
@@ -798,11 +867,23 @@ http://localhost:8080/realms/myrealm/.well-known/openid-configuration
 http://localhost:8080/realms/myrealm/protocol/openid-connect/auth
 ```
 
+Used by `/login` to start the Authorization Code flow.
+
+### Registration endpoint
+
+```text
+http://localhost:8080/realms/myrealm/protocol/openid-connect/registrations
+```
+
+Used by `/signup` to start the same flow on Keycloak's hosted registration page. Requires "User registration" to be enabled (section 4.2).
+
 ### Token endpoint
 
 ```text
 http://localhost:8080/realms/myrealm/protocol/openid-connect/token
 ```
+
+Used both by the ROPC `curl` requests (section 11) and by `/auth/callback` to exchange an authorization code for tokens.
 
 ### JWKS endpoint
 
@@ -818,7 +899,7 @@ http://localhost:8080/realms/myrealm/protocol/openid-connect/userinfo
 
 ---
 
-# 19. Stopping the Environment
+# 20. Stopping the Environment
 
 Stop the containers:
 
@@ -836,7 +917,7 @@ The current example does not configure persistent Keycloak storage, so recreatin
 
 ---
 
-# 20. Complete Request Flow
+# 21. Complete Request Flow
 
 The complete flow can be summarized as:
 
@@ -845,19 +926,22 @@ The complete flow can be summarized as:
                     │   Keycloak  │
                     └──────┬──────┘
                            │
-                    User authentication
+              User authentication
+              (password grant, or
+               login/registration
+                   page + PKCE)
                            │
                            ▼
                      Access Token
                          (JWT)
-                           │
                            │
                            ▼
                     ┌─────────────┐
                     │   Go API    │
                     └──────┬──────┘
                            │
-                    Extract Bearer token
+                Extract token from either
+              Authorization header or session
                            │
                            ▼
                       Read JWT kid
@@ -915,4 +999,4 @@ Go API
 Protected resource
 ```
 
-This separation allows the Go API to remain independent from the user's credentials while still being able to cryptographically verify that the access token was issued by the trusted Keycloak realm.
+This separation allows the Go API to remain independent from the user's credentials while still being able to cryptographically verify that the access token was issued by the trusted Keycloak realm — whether that token arrived via a raw `curl` request or via a browser session established through `/login` or `/signup`.
